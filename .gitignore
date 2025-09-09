@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+.env.*
+.DS_Store
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Vector stores / index
+faiss_index/
+*.faiss
+*.npy
+
+# Données / uploads
+data/
+uploads/
+*.pdf
+
+# Logs & cache
+.cache/
+*.log
