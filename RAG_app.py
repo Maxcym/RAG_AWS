@@ -17,6 +17,21 @@ from streamlit.runtime.uploaded_file_manager import UploadedFile
 import pypandoc
 
 
+"""
+Nova Reader — RAG Streamlit (PDF & DOCX) sur AWS Bedrock.
+
+Ce module :
+- charge des fichiers PDF/DOCX, les normalise (nettoyage, segmentation par sections),
+- découpe en chunks (structuré ou sémantique via clustering),
+- vectorise avec Titan Embeddings, indexe dans FAISS,
+- répond aux questions avec une chaîne RetrievalQA et un modèle Bedrock (Mistral Large),
+- fournit une interface Streamlit type chat.
+
+Notes sécurité / ops :
+- L’auth AWS est gérée par boto3 (variables d’env, profils, rôles IAM).
+- `FAISS.load_local(..., allow_dangerous_deserialization=True)` est risqué si l’index n’est pas de confiance.
+- Les fichiers uploadés sont écrits dans un fichier temporaire puis supprimés.
+"""
 
 # ---------------------------- AWS + LLM Configuration ----------------------------
 
@@ -55,18 +70,51 @@ PROMPT = PromptTemplate(template=prompt_template, input_variables=["context", "q
 
 # ---------------------------- File Processing ----------------------------
 
-def clean_text(text):
+def clean_text(text: str) -> str:
+    """
+    Nettoie un bloc de texte multi-lignes en :
+    - supprimant les lignes vides,
+    - trimmant chaque ligne,
+    - joignant le tout par des espaces.
+
+    Args:
+        text: Texte brut.
+
+    Returns:
+        Texte normalisé sur une seule ligne.
+    """
     lines = text.split('\n')
     return ' '.join([line.strip() for line in lines if line.strip()])
 
 
-def load_word_file(file_path):
+def load_word_file(file_path: str) -> list[Document]:
+    """
+    Charge un fichier DOCX et retourne un document LangChain.
+
+    Args:
+        file_path: Chemin du fichier .docx.
+
+    Returns:
+        Liste contenant un unique Document dont le contenu texte correspond
+        à l’enchaînement des paragraphes non vides.
+    """
     docx = DocxDocument(file_path)
     full_text = "\n".join([p.text for p in docx.paragraphs if p.text.strip()])
     return [Document(page_content=full_text, metadata={"source": file_path})]
 
 
-def split_by_sections(documents):
+def split_by_sections(documents: list[Document]) -> list[Document]:
+    """
+    Segmenter des documents en sections à l’aide de motifs (titres numérotés,
+    chiffres romains, titres en MAJ, « Chapitre N », « Section X.Y »).
+
+    Args:
+        documents: Documents LangChain (déjà nettoyés).
+
+    Returns:
+        Liste de Documents, chacun correspondant à une section détectée.
+        Métadonnées ajoutées : 'section' (titre détecté).
+    """
     section_patterns = [
         r"^\d{1,2}\.\s+[A-ZÉÈÉÀÂÎÔÙËÜ][\w\s\-\(\)]{3,}",
         r"^[IVXLC]+\.\s+[A-ZÉÈÉÀÂÎÔÙËÜ][\w\s\-\(\)]{3,}",
@@ -74,7 +122,7 @@ def split_by_sections(documents):
         r"^Chapitre\s+\d+",
         r"^Section\s+\d+(\.\d+)*",
     ]
-    sections = []
+    sections: list[Document] = []
 
     for doc in documents:
         text = doc.page_content
@@ -106,8 +154,18 @@ def split_by_sections(documents):
     return sections
 
 
-def split_into_paragraph_docs(docs):
-    paragraphs = []
+def split_into_paragraph_docs(docs: list[Document]) -> list[Document]:
+    """
+    Découpe des documents en paragraphes (séparation sur ≥ 2 sauts de ligne),
+    puis filtre les trop courts.
+
+    Args:
+        docs: Documents d’entrée (p. ex. sections).
+
+    Returns:
+        Liste de Documents, chacun contenant un paragraphe suffisamment long.
+    """
+    paragraphs: list[Document] = []
     for doc in docs:
         paras = re.split(r'\n{2,}', doc.page_content)
         for para in paras:
@@ -117,19 +175,39 @@ def split_into_paragraph_docs(docs):
     return paragraphs
 
 
-def semantic_chunking_with_clustering(paragraphs, embeddings, distance_threshold=0.2):
+def semantic_chunking_with_clustering(
+    paragraphs: list[Document],
+    embeddings: list[list[float]],
+    distance_threshold: float = 0.2
+) -> list[Document]:
+    """
+    Regroupe des paragraphes sémantiquement proches via Agglomerative Clustering,
+    puis fusionne les textes de chaque cluster.
+
+    Args:
+        paragraphs: Liste de Documents (paragraphes).
+        embeddings: Vecteurs (même ordre que `paragraphs`).
+        distance_threshold: Seuil de distance pour couper l’arbre (clusterisation hiérarchique).
+
+    Returns:
+        Liste de Documents « chunks » issus de la fusion par cluster.
+        Si < 2 paragraphes, renvoie l’entrée telle quelle.
+
+    Notes:
+        - Linkage « average » cohérent avec des distances cosinus/euclidiennes.
+        - Ajuster `distance_threshold` selon la granularité souhaitée.
+    """
     if len(paragraphs) < 2:
-        # Pas assez de docs pour cluster, on retourne juste ce qu'on a
         return paragraphs
 
     clustering = AgglomerativeClustering(linkage="average", distance_threshold=distance_threshold, n_clusters=None)
     clustering.fit(embeddings)
 
-    clusters = {}
+    clusters: dict[int, list[Document]] = {}
     for idx, label in enumerate(clustering.labels_):
         clusters.setdefault(label, []).append(paragraphs[idx])
 
-    chunks = []
+    chunks: list[Document] = []
     for label, docs in clusters.items():
         merged_text = " ".join([doc.page_content for doc in docs])
         chunks.append(Document(page_content=merged_text, metadata=docs[0].metadata.copy()))
@@ -137,7 +215,19 @@ def semantic_chunking_with_clustering(paragraphs, embeddings, distance_threshold
     return chunks
 
 
-def convert_doc_to_docx(doc_path):
+def convert_doc_to_docx(doc_path: str) -> str | None:
+    """
+    Convertit un .doc en .docx via pandoc.
+
+    Args:
+        doc_path: Chemin du fichier .doc.
+
+    Returns:
+        Chemin du .docx converti, ou None en cas d’échec.
+
+    Effets de bord:
+        Affiche une erreur Streamlit en cas d’exception.
+    """
     output = doc_path + "x"
     try:
         pypandoc.convert_file(doc_path, 'docx', outputfile=output)
@@ -146,7 +236,23 @@ def convert_doc_to_docx(doc_path):
         st.error(f"Erreur conversion .doc en .docx : {e}")
         return None
 
-def process_document(uploaded_file: UploadedFile, mode="structured"):
+
+def process_document(uploaded_file: UploadedFile, mode: str = "structured") -> list[Document]:
+    """
+    Pipeline d’ingestion d’un fichier (PDF/DOCX) : chargement, nettoyage, segmentation
+    en sections, chunking (structuré ou sémantique), enrichissement des métadonnées.
+
+    Args:
+        uploaded_file: Fichier chargé via Streamlit.
+        mode: 'structured' pour un découpage par tailles (RCTS),
+              'semantic' pour un regroupement par similarité (clustering).
+
+    Returns:
+        Liste de Documents prêts pour l’indexation (FAISS).
+
+    Raises:
+        ValueError: Si le format de fichier n’est pas supporté.
+    """
     suffix = os.path.splitext(uploaded_file.name)[1].lower()
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
@@ -165,7 +271,6 @@ def process_document(uploaded_file: UploadedFile, mode="structured"):
 
     os.remove(temp_path)
 
-    # suite inchangée
     for doc in raw_docs:
         doc.page_content = clean_text(doc.page_content)
 
@@ -187,10 +292,22 @@ def process_document(uploaded_file: UploadedFile, mode="structured"):
     return docs
 
 
-
 # ---------------------------- Vector Store ----------------------------
 
-def get_vector_store(docs):
+def get_vector_store(docs: list[Document]) -> FAISS:
+    """
+    Construit (ou reconstruit) l’index FAISS à partir des documents fournis
+    en utilisant les embeddings Titan, puis sauvegarde localement.
+
+    Args:
+        docs: Documents à indexer.
+
+    Returns:
+        Instance FAISS initialisée et persistée dans `faiss_index/`.
+
+    Notes sécurité:
+        Le répertoire généré ne doit pas être partagé s’il provient de sources non fiables.
+    """
     store = FAISS.from_documents(documents=docs, embedding=bedrock_embeddings)
     store.save_local("faiss_index")
     return store
@@ -198,7 +315,17 @@ def get_vector_store(docs):
 
 # ---------------------------- QA Chain ----------------------------
 
-def get_bedrock_llm():
+def get_bedrock_llm() -> BedrockChat:
+    """
+    Instancie le modèle de conversation Bedrock pour la génération de réponses.
+
+    Returns:
+        Un client LangChain `BedrockChat` configuré avec Mistral Large.
+
+    Remarques:
+        - Le modèle doit être activé côté Bedrock (compte & région).
+        - Les paramètres (`max_tokens`) peuvent être adaptés à la taille des réponses visées.
+    """
     return BedrockChat(
         model_id="mistral.mistral-large-2402-v1:0",
         client=bedrock,
@@ -206,7 +333,21 @@ def get_bedrock_llm():
     )
 
 
-def get_answer(llm, vectorstore, question):
+def get_answer(llm: BedrockChat, vectorstore: FAISS, question: str) -> tuple[str, list[Document]]:
+    """
+    Exécute une chaîne RetrievalQA (« stuff ») :
+    - récupère les passages les plus proches (k=3) via FAISS,
+    - formate le prompt,
+    - génère une réponse avec le LLM Bedrock.
+
+    Args:
+        llm: Modèle BedrockChat prêt à l’emploi.
+        vectorstore: Index FAISS pour la recherche de contexte.
+        question: Question utilisateur.
+
+    Returns:
+        Un tuple (réponse_textuelle, liste_des_documents_sources).
+    """
     qa = RetrievalQA.from_chain_type(
         llm=llm,
         chain_type="stuff",
@@ -220,7 +361,17 @@ def get_answer(llm, vectorstore, question):
 
 # ---------------------------- Streamlit UI ----------------------------
 
-def main():
+def main() -> None:
+    """
+    Lance l’interface Streamlit :
+    - gestion des uploads (PDF/DOCX) + indexation incrémentale,
+    - choix de la méthode de chunking (structuré / sémantique),
+    - chat d’interrogation (RAG) avec affichage des sources.
+
+    Effets de bord:
+        - Persiste/charge l’index FAISS local (`faiss_index/`).
+        - Stocke l’état dans `st.session_state`.
+    """
     st.set_page_config(page_title="Nova Reader", layout="wide")
     st.title("Nova Reader — PDF & Word via RAG + Bedrock (Mistral)")
 
@@ -244,6 +395,7 @@ def main():
         )
 
         if new_files:
+            # Déduplication basique par (nom, taille)
             existing_files = {(f.name, f.size) for f in st.session_state["uploaded_files"]}
             fresh = [f for f in new_files if (f.name, f.size) not in existing_files]
             st.session_state["uploaded_files"].extend(fresh)
@@ -271,10 +423,12 @@ def main():
         for f in st.session_state["uploaded_files"]:
             st.write(f"{f.name} ({f.size / 1024:.2f} KB)")
 
+    # Rendu de l’historique
     for message in st.session_state["messages"]:
         with st.chat_message(message["role"]):
             st.markdown(message["content"], unsafe_allow_html=False)
 
+    # Tour de chat
     if prompt:
         st.session_state["messages"].append({"role": "user", "content": prompt})
         with st.chat_message("user"):
@@ -283,6 +437,7 @@ def main():
         with st.spinner("Recherche de la réponse..."):
             vectorstore = st.session_state["vectorstore"]
             if not vectorstore:
+                # Attention : dangereux si l’index n’est pas de confiance
                 vectorstore = FAISS.load_local(
                     "faiss_index", bedrock_embeddings, allow_dangerous_deserialization=True
                 )
@@ -299,6 +454,7 @@ def main():
                 for i, doc in enumerate(sources):
                     st.markdown(f"**Extrait {i+1} — Section : {doc.metadata.get('section', 'Inconnue')} (page {doc.metadata.get('page', 'N/A')})**")
                     st.text(doc.page_content[:500])
+
 
 if __name__ == "__main__":
     main()
