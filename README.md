@@ -62,7 +62,6 @@ Nova Reader répond à ce besoin en offrant :
 ```bash
 # Cloner le dépôt
 git clone https://github.com/Maxcym/RAG_AWS
-cd Nova-Reader
 
 # Créer un environnement virtuel (recommandé)
 python -m venv venv
