@@ -61,7 +61,7 @@ Nova Reader répond à ce besoin en offrant :
 
 ```bash
 # Cloner le dépôt
-git clone [https://github.com/<votre-utilisateur>/Nova-Reader.git](https://github.com/Maxcym/RAG_AWS) 
+git clone https://github.com/Maxcym/RAG_AWS
 cd Nova-Reader
 
 # Créer un environnement virtuel (recommandé)
